@@ -221,21 +221,17 @@ jobs:
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] ||
-             [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ] ||
-             [ -z "${ANDROID_KEY_ALIAS:-}" ] ||
-             [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
-            echo "::error::Android signing secrets are missing."
-            echo "Configure all four signing secrets in GitHub repository settings."
-            exit 1
-          fi
+          : "${ANDROID_KEYSTORE_BASE64:?GitHub Secret ANDROID_KEYSTORE_BASE64 is missing or empty}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?GitHub Secret KEYSTORE_PASSWORD is missing or empty}"
+          : "${ANDROID_KEY_ALIAS:?GitHub Secret KEY_ALIAS is missing or empty}"
+          : "${ANDROID_KEY_PASSWORD:?GitHub Secret KEY_PASSWORD is missing or empty}"
 
           KEYSTORE="$RUNNER_TEMP/catch-star-upload.jks"
 
@@ -243,11 +239,10 @@ jobs:
             | base64 --decode > "$KEYSTORE"
 
           test -s "$KEYSTORE"
+
           keytool -list \
             -keystore "$KEYSTORE" \
             -storepass "$ANDROID_KEYSTORE_PASSWORD" >/dev/null
-
-          export ANDROID_KEYSTORE_FILE="$KEYSTORE"
 
           echo "ANDROID_KEYSTORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
 
@@ -273,28 +268,27 @@ jobs:
                   }
               }
           """
-              if not re.search(r"\bandroid\s*\{", text):
-                  raise SystemExit("Android Gradle block was not found.")
 
-              text = re.sub(
+              text, count = re.subn(
                   r"\bandroid\s*\{",
                   lambda m: m.group(0) + "\n" + signing,
                   text,
                   count=1
               )
 
+              if count == 0:
+                  raise SystemExit("Android Gradle block was not found.")
+
           if "signingConfig signingConfigs.release" not in text:
-              pattern = r"(buildTypes\s*\{\s*release\s*\{)"
               text, count = re.subn(
-                  pattern,
+                  r"(buildTypes\s*\{\s*release\s*\{)",
                   r"\1\n            signingConfig signingConfigs.release",
                   text,
                   count=1
               )
+
               if count == 0:
-                  raise SystemExit(
-                      "Could not find the release build type for signing."
-                  )
+                  raise SystemExit("Release build type was not found.")
 
           gradle.write_text(text, encoding="utf-8")
           print("Release signing configuration prepared.")
@@ -303,9 +297,9 @@ jobs:
       - name: Build Release AAB
         shell: bash
         env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR/android"
