@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Signed Android App Bundle
+    name: Build Android AAB
     runs-on: ubuntu-latest
 
     env:
@@ -35,9 +35,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
 
-      - name: Locate and extract game ZIP
+      - name: Locate game ZIP
         shell: bash
         run: |
           set -euo pipefail
@@ -56,73 +55,44 @@ jobs:
           done
 
           if [ -z "$ZIP_FILE" ]; then
-            ZIP_FILE="$(find . -maxdepth 2 -type f \
+            ZIP_FILE="$(find . -maxdepth 3 -type f \
               -iname '*catch*star*glow*.zip' \
-              -not -path './.git/*' \
+              -not -path '*/.git/*' \
               | head -n 1 || true)"
           fi
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "::error::Catch The Star Glow project ZIP was not found."
-            echo "Upload the complete game ZIP to the repository root."
+            echo "::error::Game ZIP not found in the repository."
             exit 1
           fi
 
-          echo "Selected project ZIP: $ZIP_FILE"
+          echo "Selected ZIP: $ZIP_FILE"
 
           mkdir -p "$RUNNER_TEMP/catch-star-project"
-          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/catch-star-project"
+
+          unzip -q "$ZIP_FILE" \
+            -d "$RUNNER_TEMP/catch-star-project"
 
           PROJECT_DIR="$RUNNER_TEMP/catch-star-project"
 
-          if [ ! -f "$PROJECT_DIR/package.json" ]; then
-            FOUND_PACKAGE="$(find "$PROJECT_DIR" -mindepth 2 \
-              -maxdepth 5 -type f -name package.json \
-              -not -path '*/node_modules/*' \
-              | head -n 1 || true)"
+          PACKAGE_FILE="$(find "$PROJECT_DIR" \
+            -type f \
+            -name package.json \
+            -not -path '*/node_modules/*' \
+            | head -n 1 || true)"
 
-            if [ -z "$FOUND_PACKAGE" ]; then
-              echo "::error::package.json was not found in the extracted ZIP."
-              exit 1
-            fi
-
-            PROJECT_DIR="$(dirname "$FOUND_PACKAGE")"
-          fi
-
-          if [ ! -f "$PROJECT_DIR/package.json" ]; then
-            echo "::error::Invalid project directory."
+          if [ -z "$PACKAGE_FILE" ]; then
+            echo "::error::package.json not found inside the game ZIP."
             exit 1
           fi
+
+          PROJECT_DIR="$(dirname "$PACKAGE_FILE")"
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
           echo "Game project located successfully."
 
-      - name: Check required project files
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          test -f package.json || {
-            echo "::error::package.json is missing."
-            exit 1
-          }
-
-          if [ ! -f package-lock.json ]; then
-            echo "::error::package-lock.json is missing. npm ci cannot run."
-            exit 1
-          fi
-
-          echo "Project files checked."
-
-      - name: Install npm dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          npm ci
-
-      - name: Check Android and Capacitor configuration
+      - name: Validate project configuration
         shell: bash
         run: |
           set -euo pipefail
@@ -130,31 +100,62 @@ jobs:
 
           node -e "
             const p = require('./package.json');
-            const deps = {...p.dependencies, ...p.devDependencies};
-            if (!deps['@capacitor/core'] ||
-                !deps['@capacitor/android']) {
-              console.error('Capacitor Android dependencies are missing.');
+            if (!p.scripts || !p.scripts.build) {
+              console.error('The build script is missing from package.json.');
               process.exit(1);
             }
           "
 
+          echo "Project build configuration found."
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          npm install --no-audit --no-fund
+
+      - name: Check Capacitor configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          node - <<'NODE'
+          const p = require('./package.json');
+          const deps = {
+            ...(p.dependencies || {}),
+            ...(p.devDependencies || {})
+          };
+
+          if (!deps['@capacitor/core'] ||
+              !deps['@capacitor/android']) {
+            console.error(
+              'Capacitor Android dependencies are missing.'
+            );
+            process.exit(1);
+          }
+          NODE
+
           if [ ! -f capacitor.config.ts ] &&
              [ ! -f capacitor.config.json ] &&
              [ ! -f capacitor.config.js ]; then
-            echo "::error::Capacitor configuration was not found."
+            echo "::error::Capacitor configuration is missing."
             exit 1
           fi
 
-          echo "Capacitor configuration found."
+          echo "Capacitor configuration verified."
 
       - name: Build web application
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
+
           npm run build
 
-      - name: Sync Capacitor Android project
+      - name: Synchronize Android project
         shell: bash
         run: |
           set -euo pipefail
@@ -164,12 +165,6 @@ jobs:
 
           if [ ! -f android/gradlew ]; then
             echo "::error::Android Gradle wrapper is missing."
-            exit 1
-          fi
-
-          if [ ! -f android/app/build.gradle ] &&
-             [ ! -f android/app/build.gradle.kts ]; then
-            echo "::error::Android app Gradle configuration is missing."
             exit 1
           fi
 
@@ -183,91 +178,66 @@ jobs:
           from pathlib import Path
           import re
 
-          candidates = [
-              Path("android/variables.gradle"),
-              Path("android/app/build.gradle"),
-              Path("android/app/build.gradle.kts"),
-          ]
+          variables = Path("android/variables.gradle")
 
-          found = False
+          if variables.exists():
+              text = variables.read_text(encoding="utf-8")
 
-          for path in candidates:
-              if not path.exists():
-                  continue
-
-              text = path.read_text(encoding="utf-8")
-
-              if path.name == "variables.gradle":
-                  for key in ("compileSdkVersion", "targetSdkVersion"):
-                      pattern = rf"({key}\s*=\s*)\d+"
-                      text, count = re.subn(pattern, rf"\g<1>36", text)
-                      found = found or count > 0
-
-                  path.write_text(text, encoding="utf-8")
-
-              elif path.name == "build.gradle":
-                  if re.search(r"\bcompileSdk\s+\d+", text):
-                      text = re.sub(
-                          r"\bcompileSdk\s+\d+",
-                          "compileSdk 36",
-                          text,
-                      )
-                      found = True
-
-                  if re.search(r"\btargetSdk\s+\d+", text):
-                      text = re.sub(
-                          r"\btargetSdk\s+\d+",
-                          "targetSdk 36",
-                          text,
-                      )
-                      found = True
-
-                  path.write_text(text, encoding="utf-8")
-
-              elif path.name == "build.gradle.kts":
-                  if re.search(r"\bcompileSdk\s*=\s*\d+", text):
-                      text = re.sub(
-                          r"\bcompileSdk\s*=\s*\d+",
-                          "compileSdk = 36",
-                          text,
-                      )
-                      found = True
-
-                  if re.search(r"\btargetSdk\s*=\s*\d+", text):
-                      text = re.sub(
-                          r"\btargetSdk\s*=\s*\d+",
-                          "targetSdk = 36",
-                          text,
-                      )
-                      found = True
-
-                  path.write_text(text, encoding="utf-8")
-
-          if not found:
-              print(
-                  "Warning: API settings were not automatically changed. "
-                  "The project may define them in another Gradle file."
+              text = re.sub(
+                  r"(compileSdkVersion\s*=\s*)\d+",
+                  r"\g<1>36",
+                  text
               )
-          else:
-              print("Android SDK settings updated where recognized.")
+
+              text = re.sub(
+                  r"(targetSdkVersion\s*=\s*)\d+",
+                  r"\g<1>36",
+                  text
+              )
+
+              variables.write_text(text, encoding="utf-8")
+
+          gradle = Path("android/app/build.gradle")
+
+          if gradle.exists():
+              text = gradle.read_text(encoding="utf-8")
+
+              text = re.sub(
+                  r"\bcompileSdk\s+\d+",
+                  "compileSdk 36",
+                  text
+              )
+
+              text = re.sub(
+                  r"\btargetSdk\s+\d+",
+                  "targetSdk 36",
+                  text
+              )
+
+              gradle.write_text(text, encoding="utf-8")
+
+          print("API 36 configuration checked.")
           PY
 
-      - name: Validate signing secrets and keystore
+      - name: Validate and decode signing key
         shell: bash
         run: |
           set -euo pipefail
 
-          : "${ANDROID_KEYSTORE_BASE64:?GitHub Secret KEYSTORE_BASE64 is missing or empty}"
-          : "${ANDROID_KEYSTORE_PASSWORD:?GitHub Secret KEYSTORE_PASSWORD is missing or empty}"
-          : "${ANDROID_KEY_ALIAS:?GitHub Secret KEY_ALIAS is missing or empty}"
-          : "${ANDROID_KEY_PASSWORD:?GitHub Secret KEY_PASSWORD is missing or empty}"
+          : "${ANDROID_KEYSTORE_BASE64:?Secret KEYSTORE_BASE64 is missing or empty}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Secret KEYSTORE_PASSWORD is missing or empty}"
+          : "${ANDROID_KEY_ALIAS:?Secret KEY_ALIAS is missing or empty}"
+          : "${ANDROID_KEY_PASSWORD:?Secret KEY_PASSWORD is missing or empty}"
 
           KEYSTORE="$RUNNER_TEMP/catch-star-upload.jks"
 
           printf '%s' "$ANDROID_KEYSTORE_BASE64" |
             base64 --decode > "$KEYSTORE"
 
-          test -s "$KEYSTORE"
+          if [ ! -s "$KEYSTORE" ]; then
+            echo "::error::Decoded keystore file is empty."
+            exit 1
+          fi
 
           keytool -list \
             -keystore "$KEYSTORE" \
@@ -276,7 +246,7 @@ jobs:
 
           echo "ANDROID_KEYSTORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
 
-          echo "Keystore validation successful."
+          echo "Signing key validated."
 
       - name: Configure release signing
         shell: bash
@@ -291,19 +261,12 @@ jobs:
           gradle = Path("android/app/build.gradle")
 
           if not gradle.exists():
-              gradle = Path("android/app/build.gradle.kts")
-
-          if not gradle.exists():
-              raise SystemExit("Android app Gradle file was not found.")
+              raise SystemExit(
+                  "Groovy build.gradle not found. "
+                  "Kotlin DSL projects need a different signing patch."
+              )
 
           text = gradle.read_text(encoding="utf-8")
-
-          if gradle.suffix == ".kts":
-              raise SystemExit(
-                  "Kotlin DSL Gradle detected. "
-                  "Automatic Groovy signing configuration was skipped "
-                  "to avoid corrupting the project."
-              )
 
           if "signingConfigs {" not in text:
               signing = """
@@ -321,60 +284,66 @@ jobs:
                   r"\bandroid\s*\{",
                   lambda m: m.group(0) + "\n" + signing,
                   text,
-                  count=1,
+                  count=1
               )
 
               if count == 0:
-                  raise SystemExit("Android Gradle block was not found.")
+                  raise SystemExit(
+                      "Could not find the Android Gradle configuration."
+                  )
 
           if "signingConfig signingConfigs.release" not in text:
               text, count = re.subn(
                   r"(buildTypes\s*\{\s*release\s*\{)",
                   r"\1\n            signingConfig signingConfigs.release",
                   text,
-                  count=1,
+                  count=1
               )
 
               if count == 0:
                   raise SystemExit(
-                      "Release build type was not found. "
-                      "Signing configuration was not safely applied."
+                      "Could not find the release build configuration."
                   )
 
           gradle.write_text(text, encoding="utf-8")
-          print("Release signing configuration prepared.")
+
+          print("Release signing configured.")
           PY
 
-      - name: Build Release AAB
+      - name: Build signed Release AAB
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR/android"
 
           chmod +x gradlew
+
           ./gradlew --no-daemon bundleRelease
 
-      - name: Verify AAB output
+      - name: Find and prepare AAB
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          AAB="$(find android -type f \
+          AAB_FILE="$(find android \
+            -type f \
             -path '*/outputs/bundle/release/*.aab' \
             | head -n 1 || true)"
 
-          if [ -z "$AAB" ]; then
-            echo "::error::Release AAB was not generated."
+          if [ -z "$AAB_FILE" ]; then
+            echo "::error::AAB output was not found."
             exit 1
           fi
 
           mkdir -p "$RUNNER_TEMP/catch-star-output"
-          cp "$AAB" "$RUNNER_TEMP/catch-star-output/Catch-The-Star-Glow.aab"
 
-          echo "AAB generated successfully."
+          cp "$AAB_FILE" \
+            "$RUNNER_TEMP/catch-star-output/Catch-The-Star-Glow.aab"
 
-      - name: Upload signed AAB
+          echo "AAB prepared successfully."
+
+      - name: Upload Android AAB
         uses: actions/upload-artifact@v4
         with:
           name: Catch-The-Star-Glow-Android-AAB
