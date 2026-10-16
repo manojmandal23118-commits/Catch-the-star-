@@ -1,4 +1,4 @@
-name: Catch The Star Glow - Android AAB API 36
+name: Catch The Star Glow - Android API 36 AAB
 
 on:
   workflow_dispatch:
@@ -17,11 +17,37 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Find and Extract Game ZIP
+        run: |
+          mkdir -p game-source
+
+          ZIP_FILE=$(find . -maxdepth 1 -type f -iname '*.zip' | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No game ZIP found in repository root."
+            exit 1
+          fi
+
+          echo "Extracting: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d game-source
+
+          PACKAGE_FILE=$(find game-source -name package.json -not -path '*/node_modules/*' | head -n 1)
+
+          if [ -z "$PACKAGE_FILE" ]; then
+            echo "ERROR: package.json not found inside ZIP."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PACKAGE_FILE")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Game source: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -30,67 +56,89 @@ jobs:
           java-version: '17'
 
       - name: Install Dependencies
-        run: npm ci
-
-      - name: Build Web App
-        run: npm run build
-
-      - name: Setup Android Platform
         run: |
-          npx cap add android
+          cd "$PROJECT_DIR"
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build Game
+        run: |
+          cd "$PROJECT_DIR"
+          npm run build
+
+      - name: Check Capacitor
+        run: |
+          cd "$PROJECT_DIR"
+          node -e "console.log(require('./package.json').dependencies?.['@capacitor/core'] || 'Capacitor dependency not found')"
+
+      - name: Prepare Android Project
+        run: |
+          cd "$PROJECT_DIR"
+
+          if [ ! -f capacitor.config.ts ] && \
+             [ ! -f capacitor.config.json ] && \
+             [ ! -f capacitor.config.js ]; then
+            echo "ERROR: Capacitor configuration not found."
+            exit 1
+          fi
+
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+
           npx cap sync android
-
-      - name: Configure Android API 36
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("android/variables.gradle")
-          if p.exists():
-              s = p.read_text()
-              import re
-              s = re.sub(
-                  r"cdvCompileSdkVersion\s*=\s*\d+",
-                  "cdvCompileSdkVersion = 36", s
-              )
-              s = re.sub(
-                  r"cdvTargetSdkVersion\s*=\s*\d+",
-                  "cdvTargetSdkVersion = 36", s
-              )
-              p.write_text(s)
-
-          p = Path("android/app/build.gradle")
-          s = p.read_text()
-          import re
-
-          s = re.sub(
-              r"compileSdkVersion\s+\d+",
-              "compileSdkVersion 36", s
-          )
-          s = re.sub(
-              r"targetSdkVersion\s+\d+",
-              "targetSdkVersion 36", s
-          )
-          p.write_text(s)
-          PY
 
       - name: Install Android SDK 36
         run: |
           SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+
           yes | "$SDKMANAGER" --licenses
+
           "$SDKMANAGER" "platforms;android-36"
           "$SDKMANAGER" "build-tools;36.0.0"
 
-      - name: Build Release AAB
-        working-directory: android
+      - name: Configure Android API 36
         run: |
+          cd "$PROJECT_DIR/android"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("app/build.gradle")
+          if not p.exists():
+              p = Path("app/build.gradle.kts")
+
+          if not p.exists():
+              raise SystemExit("Android app Gradle file not found")
+
+          s = p.read_text()
+
+          if p.suffix == ".kts":
+              s = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 36', s)
+              s = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 36', s)
+          else:
+              s = re.sub(r'compileSdk\s+\d+', 'compileSdk 36', s)
+              s = re.sub(r'targetSdkVersion\s+\d+', 'targetSdkVersion 36', s)
+              s = re.sub(r'targetSdk\s+\d+', 'targetSdk 36', s)
+
+          p.write_text(s)
+          PY
+
+      - name: Build Release AAB
+        run: |
+          cd "$PROJECT_DIR/android"
           chmod +x gradlew
           ./gradlew --no-daemon bundleRelease
 
-      - name: Upload AAB
+      - name: Upload AAB Artifact
         uses: actions/upload-artifact@v4
         with:
           name: catch-the-star-glow-aab
-          path: android/app/build/outputs/bundle/release/*.aab
+          path: game-source/**/android/app/build/outputs/bundle/release/*.aab
           if-no-files-found: error
           retention-days: 14
