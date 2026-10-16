@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Android AAB
+    name: Build Android App Bundle
     runs-on: ubuntu-latest
 
     steps:
@@ -30,37 +30,67 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Check project files
+      - name: Find and extract project ZIP
+        shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -f package.json ]; then
-            echo "::error::package.json is missing from the repository root."
-            exit 1
+          if [ -f package.json ]; then
+            echo "Project already exists in repository root."
+          else
+            ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' \
+              ! -path './.git/*' | head -n 1)"
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "::error::package.json and project ZIP were not found."
+              echo "Upload the complete project ZIP to the repository."
+              exit 1
+            fi
+
+            echo "Extracting: $ZIP_FILE"
+            mkdir -p /tmp/catch-star-project
+            unzip -oq "$ZIP_FILE" -d /tmp/catch-star-project
+
+            PACKAGE_FILE="$(find /tmp/catch-star-project \
+              -type f -name package.json | head -n 1)"
+
+            if [ -z "$PACKAGE_FILE" ]; then
+              echo "::error::No package.json found inside the ZIP."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$PACKAGE_FILE")"
+            cp -a "$PROJECT_DIR/." "$GITHUB_WORKSPACE/"
           fi
 
-          echo "Project files:"
+          test -f package.json || {
+            echo "::error::package.json is still missing."
+            exit 1
+          }
+
+          echo "Project root:"
+          pwd
           ls -la
 
-      - name: Install dependencies
+      - name: Install Node dependencies
+        shell: bash
         run: |
           set -euo pipefail
 
-          if [ -f package-lock.json ]; then
-            npm ci
-          elif [ -f npm-shrinkwrap.json ]; then
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
             npm ci
           else
-            echo "::warning::No npm lock file found. Installing dependencies with npm install."
             npm install
           fi
 
-      - name: Build Next.js application
+      - name: Build web application
+        shell: bash
         run: |
           set -euo pipefail
           npm run build
 
       - name: Check Capacitor configuration
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -73,7 +103,8 @@ jobs:
 
           npx cap --version
 
-      - name: Add Android platform if missing
+      - name: Prepare Android platform
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -81,17 +112,19 @@ jobs:
             npx cap add android
           fi
 
-          if [ ! -d android ]; then
+          test -d android || {
             echo "::error::Android platform was not created."
             exit 1
-          fi
+          }
 
-      - name: Sync Capacitor Android
+      - name: Sync Android
+        shell: bash
         run: |
           set -euo pipefail
           npx cap sync android
 
-      - name: Validate Android project
+      - name: Verify Android Gradle files
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -109,12 +142,13 @@ jobs:
           fi
 
       - name: Build Release AAB
+        shell: bash
         run: |
           set -euo pipefail
           cd android
           ./gradlew --no-daemon bundleRelease
 
-      - name: Upload Android AAB
+      - name: Upload AAB
         uses: actions/upload-artifact@v4
         with:
           name: catch-the-star-glow-release-aab
