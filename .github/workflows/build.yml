@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Signed Android AAB
+    name: Build Android AAB
     runs-on: ubuntu-latest
 
     steps:
@@ -22,8 +22,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: "20"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -31,21 +30,37 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Check project files
+        run: |
+          set -euo pipefail
+
+          if [ ! -f package.json ]; then
+            echo "::error::package.json is missing from the repository root."
+            exit 1
+          fi
+
+          echo "Project files:"
+          ls -la
+
       - name: Install dependencies
         run: |
           set -euo pipefail
-          test -f package.json || {
-            echo "::error::package.json missing from repository root."
-            exit 1
-          }
-          npm ci
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            echo "::warning::No npm lock file found. Installing dependencies with npm install."
+            npm install
+          fi
 
       - name: Build Next.js application
         run: |
           set -euo pipefail
           npm run build
 
-      - name: Prepare Capacitor configuration
+      - name: Check Capacitor configuration
         run: |
           set -euo pipefail
 
@@ -64,61 +79,42 @@ jobs:
 
           if [ ! -d android ]; then
             npx cap add android
-          else
-            echo "Android platform already exists."
           fi
 
-          test -d android || {
-            echo "::error::Android platform creation failed."
+          if [ ! -d android ]; then
+            echo "::error::Android platform was not created."
             exit 1
-          }
+          fi
 
-      - name: Sync Capacitor
+      - name: Sync Capacitor Android
         run: |
           set -euo pipefail
           npx cap sync android
 
-      - name: Set Android SDK 36
-        run: |
-          set -euo pipefail
-
-          if [ ! -f android/variables.gradle ]; then
-            echo "::warning::android/variables.gradle not found; checking app Gradle configuration."
-          fi
-
-          echo "Checking Android Gradle configuration..."
-          grep -R -nE 'compileSdk|targetSdk' \
-            android/app/build.gradle \
-            android/app/build.gradle.kts \
-            android/variables.gradle \
-            2>/dev/null || true
-
-      - name: Validate Android Gradle project
+      - name: Validate Android project
         run: |
           set -euo pipefail
 
           test -f android/gradlew || {
-            echo "::error::Gradle wrapper missing from android directory."
+            echo "::error::android/gradlew is missing."
             exit 1
           }
 
           chmod +x android/gradlew
 
-          test -f android/app/build.gradle -o \
-               -f android/app/build.gradle.kts || {
-            echo "::error::Android app Gradle file missing."
+          if [ ! -f android/app/build.gradle ] && \
+             [ ! -f android/app/build.gradle.kts ]; then
+            echo "::error::Android app Gradle file is missing."
             exit 1
-          }
+          fi
 
       - name: Build Release AAB
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
         run: |
           set -euo pipefail
           cd android
           ./gradlew --no-daemon bundleRelease
 
-      - name: Upload AAB artifact
+      - name: Upload Android AAB
         uses: actions/upload-artifact@v4
         with:
           name: catch-the-star-glow-release-aab
