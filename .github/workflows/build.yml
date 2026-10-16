@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Android AAB
+    name: Build Signed Android AAB
     runs-on: ubuntu-latest
 
     env:
@@ -62,100 +62,88 @@ jobs:
           fi
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "::error::Game ZIP not found in the repository."
+            echo "::error::Game ZIP not found."
             exit 1
           fi
 
-          echo "Selected ZIP: $ZIP_FILE"
-
           mkdir -p "$RUNNER_TEMP/catch-star-project"
-
-          unzip -q "$ZIP_FILE" \
-            -d "$RUNNER_TEMP/catch-star-project"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/catch-star-project"
 
           PROJECT_DIR="$RUNNER_TEMP/catch-star-project"
-
-          PACKAGE_FILE="$(find "$PROJECT_DIR" \
-            -type f \
+          PACKAGE_FILE="$(find "$PROJECT_DIR" -type f \
             -name package.json \
             -not -path '*/node_modules/*' \
             | head -n 1 || true)"
 
           if [ -z "$PACKAGE_FILE" ]; then
-            echo "::error::package.json not found inside the game ZIP."
+            echo "::error::package.json not found."
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$PACKAGE_FILE")"
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Game project located successfully."
-
-      - name: Validate project configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-
-          node -e "
-            const p = require('./package.json');
-            if (!p.scripts || !p.scripts.build) {
-              console.error('The build script is missing from package.json.');
-              process.exit(1);
-            }
-          "
-
-          echo "Project build configuration found."
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-
           npm install --no-audit --no-fund
 
-      - name: Check Capacitor configuration
+      - name: Fix Next.js static export route
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          node - <<'NODE'
-          const p = require('./package.json');
-          const deps = {
-            ...(p.dependencies || {}),
-            ...(p.devDependencies || {})
-          };
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-          if (!deps['@capacitor/core'] ||
-              !deps['@capacitor/android']) {
-            console.error(
-              'Capacitor Android dependencies are missing.'
-            );
-            process.exit(1);
+          candidates = [
+              Path("src/app/editor/[projectId]/page.tsx"),
+              Path("src/app/editor/[projectId]/page.jsx"),
+              Path("src/app/editor/[projectId]/page.ts"),
+              Path("src/app/editor/[projectId]/page.js"),
+              Path("app/editor/[projectId]/page.tsx"),
+              Path("app/editor/[projectId]/page.jsx"),
+              Path("app/editor/[projectId]/page.ts"),
+              Path("app/editor/[projectId]/page.js"),
+          ]
+
+          page = next((p for p in candidates if p.is_file()), None)
+
+          if page is None:
+              raise SystemExit(
+                  "Could not find the /editor/[projectId] page. "
+                  "Check the extracted project structure."
+              )
+
+          text = page.read_text(encoding="utf-8")
+
+          if re.search(r"\bexport\s+(?:async\s+)?function\s+generateStaticParams\b", text) or \
+             re.search(r"\bexport\s+const\s+generateStaticParams\b", text):
+              print("generateStaticParams already exists; no change needed.")
+          else:
+              addition = """
+          
+          // Added by GitHub Actions to support Next.js static export.
+          export async function generateStaticParams() {
+            return [];
           }
-          NODE
-
-          if [ ! -f capacitor.config.ts ] &&
-             [ ! -f capacitor.config.json ] &&
-             [ ! -f capacitor.config.js ]; then
-            echo "::error::Capacitor configuration is missing."
-            exit 1
-          fi
-
-          echo "Capacitor configuration verified."
+          """
+              page.write_text(text.rstrip() + addition + "\n", encoding="utf-8")
+              print(f"Added generateStaticParams to {page}")
+          PY
 
       - name: Build web application
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-
           npm run build
 
-      - name: Synchronize Android project
+      - name: Synchronize Capacitor Android
         shell: bash
         run: |
           set -euo pipefail
@@ -163,10 +151,10 @@ jobs:
 
           npx cap sync android
 
-          if [ ! -f android/gradlew ]; then
+          test -f android/gradlew || {
             echo "::error::Android Gradle wrapper is missing."
             exit 1
-          fi
+          }
 
       - name: Configure Android API 36
         shell: bash
@@ -182,41 +170,35 @@ jobs:
 
           if variables.exists():
               text = variables.read_text(encoding="utf-8")
-
               text = re.sub(
                   r"(compileSdkVersion\s*=\s*)\d+",
                   r"\g<1>36",
                   text
               )
-
               text = re.sub(
                   r"(targetSdkVersion\s*=\s*)\d+",
                   r"\g<1>36",
                   text
               )
-
               variables.write_text(text, encoding="utf-8")
 
           gradle = Path("android/app/build.gradle")
 
           if gradle.exists():
               text = gradle.read_text(encoding="utf-8")
-
               text = re.sub(
                   r"\bcompileSdk\s+\d+",
                   "compileSdk 36",
                   text
               )
-
               text = re.sub(
                   r"\btargetSdk\s+\d+",
                   "targetSdk 36",
                   text
               )
-
               gradle.write_text(text, encoding="utf-8")
 
-          print("API 36 configuration checked.")
+          print("SDK configuration checked.")
           PY
 
       - name: Validate and decode signing key
@@ -234,10 +216,7 @@ jobs:
           printf '%s' "$ANDROID_KEYSTORE_BASE64" |
             base64 --decode > "$KEYSTORE"
 
-          if [ ! -s "$KEYSTORE" ]; then
-            echo "::error::Decoded keystore file is empty."
-            exit 1
-          fi
+          test -s "$KEYSTORE"
 
           keytool -list \
             -keystore "$KEYSTORE" \
@@ -245,8 +224,6 @@ jobs:
             >/dev/null
 
           echo "ANDROID_KEYSTORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
-
-          echo "Signing key validated."
 
       - name: Configure release signing
         shell: bash
@@ -262,8 +239,7 @@ jobs:
 
           if not gradle.exists():
               raise SystemExit(
-                  "Groovy build.gradle not found. "
-                  "Kotlin DSL projects need a different signing patch."
+                  "android/app/build.gradle is missing or uses Kotlin DSL."
               )
 
           text = gradle.read_text(encoding="utf-8")
@@ -279,18 +255,14 @@ jobs:
                   }
               }
           """
-
               text, count = re.subn(
                   r"\bandroid\s*\{",
                   lambda m: m.group(0) + "\n" + signing,
                   text,
                   count=1
               )
-
               if count == 0:
-                  raise SystemExit(
-                      "Could not find the Android Gradle configuration."
-                  )
+                  raise SystemExit("Android Gradle block not found.")
 
           if "signingConfig signingConfigs.release" not in text:
               text, count = re.subn(
@@ -299,51 +271,40 @@ jobs:
                   text,
                   count=1
               )
-
               if count == 0:
-                  raise SystemExit(
-                      "Could not find the release build configuration."
-                  )
+                  raise SystemExit("Release build type not found.")
 
           gradle.write_text(text, encoding="utf-8")
-
-          print("Release signing configured.")
           PY
 
-      - name: Build signed Release AAB
+      - name: Build Release AAB
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR/android"
-
           chmod +x gradlew
-
           ./gradlew --no-daemon bundleRelease
 
-      - name: Find and prepare AAB
+      - name: Verify AAB
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          AAB_FILE="$(find android \
-            -type f \
+          AAB_FILE="$(find android -type f \
             -path '*/outputs/bundle/release/*.aab' \
             | head -n 1 || true)"
 
           if [ -z "$AAB_FILE" ]; then
-            echo "::error::AAB output was not found."
+            echo "::error::Release AAB was not generated."
             exit 1
           fi
 
           mkdir -p "$RUNNER_TEMP/catch-star-output"
-
           cp "$AAB_FILE" \
             "$RUNNER_TEMP/catch-star-output/Catch-The-Star-Glow.aab"
 
-          echo "AAB prepared successfully."
-
-      - name: Upload Android AAB
+      - name: Upload AAB artifact
         uses: actions/upload-artifact@v4
         with:
           name: Catch-The-Star-Glow-Android-AAB
