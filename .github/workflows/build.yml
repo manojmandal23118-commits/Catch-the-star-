@@ -35,24 +35,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          ZIP_FILE="./CATCH-THE-STAR-GLOW-LOGO-FIX-ROOT-CAUSE.zip"
+
           if [ -f package.json ]; then
             echo "Project already exists in repository root."
           else
-            ZIP_FILE="$(find . -maxdepth 3 -type f -iname '*.zip' \
-              ! -path './.git/*' | head -n 1)"
-
-            if [ -z "$ZIP_FILE" ]; then
-              echo "::error::package.json and project ZIP were not found."
-              echo "Upload the complete project ZIP to the repository."
+            if [ ! -f "$ZIP_FILE" ]; then
+              echo "::error::Required project ZIP not found: $ZIP_FILE"
+              echo "Upload the exact ZIP file to the repository root."
               exit 1
             fi
 
-            echo "Extracting: $ZIP_FILE"
             mkdir -p /tmp/catch-star-project
             unzip -oq "$ZIP_FILE" -d /tmp/catch-star-project
 
             PACKAGE_FILE="$(find /tmp/catch-star-project \
-              -type f -name package.json | head -n 1)"
+              -type f -name package.json -print -quit)"
 
             if [ -z "$PACKAGE_FILE" ]; then
               echo "::error::No package.json found inside the ZIP."
@@ -64,7 +62,7 @@ jobs:
           fi
 
           test -f package.json || {
-            echo "::error::package.json is still missing."
+            echo "::error::package.json is missing."
             exit 1
           }
 
@@ -123,6 +121,53 @@ jobs:
           set -euo pipefail
           npx cap sync android
 
+      - name: Apply custom launcher icons
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ICON_SOURCE="$GITHUB_WORKSPACE/android-icon-assets"
+          ANDROID_RES="$GITHUB_WORKSPACE/android/app/src/main/res"
+
+          if [ ! -d "$ICON_SOURCE" ]; then
+            echo "::error::android-icon-assets folder was not found."
+            echo "The ZIP must contain the prepared launcher icon resources."
+            exit 1
+          fi
+
+          # Copy custom icon resources after Capacitor sync.
+          cp -a "$ICON_SOURCE/." "$ANDROID_RES/"
+
+          # Verify standard launcher icon resources.
+          for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            test -f "$ANDROID_RES/mipmap-$density/ic_launcher.png" || {
+              echo "::error::Missing ic_launcher.png for $density."
+              exit 1
+            }
+          done
+
+          # Verify adaptive launcher icon configuration.
+          test -f "$ANDROID_RES/mipmap-anydpi-v26/ic_launcher.xml" || {
+            echo "::error::Adaptive launcher icon XML is missing."
+            exit 1
+          }
+
+          # Verify Android manifest uses the launcher icon.
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          test -f "$MANIFEST" || {
+            echo "::error::AndroidManifest.xml is missing."
+            exit 1
+          }
+
+          if ! grep -Eq 'android:icon="@mipmap/ic_launcher"' "$MANIFEST"; then
+            echo "::error::Manifest does not reference @mipmap/ic_launcher."
+            grep -n 'android:icon' "$MANIFEST" || true
+            exit 1
+          fi
+
+          echo "Custom launcher icon resources verified."
+
       - name: Verify Android Gradle files
         shell: bash
         run: |
@@ -147,6 +192,22 @@ jobs:
           set -euo pipefail
           cd android
           ./gradlew --no-daemon bundleRelease
+
+      - name: Verify AAB output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AAB_FILE="android/app/build/outputs/bundle/release/app-release.aab"
+
+          if [ ! -f "$AAB_FILE" ]; then
+            echo "::error::Release AAB was not generated."
+            find android/app/build/outputs -type f -name '*.aab' || true
+            exit 1
+          fi
+
+          echo "Release AAB successfully generated:"
+          ls -lh "$AAB_FILE"
 
       - name: Upload AAB
         uses: actions/upload-artifact@v4
